@@ -1,0 +1,44 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# === Virtual environments ===
+venv/
+env/
+.env/
+
+# === Jupyter Notebooks ===
+.ipynb_checkpoints/
+
+# === Model checkpoints & logs (large files) ===
+checkpoints/
+logs/
+results/
+*.pt
+*.pth
+*.onnx
+
+# === Dataset (never commit data) ===
+DAVISDataset/
+data/DAVIS*/
+*.zip
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Misc ===
+*.log
+wandb/
