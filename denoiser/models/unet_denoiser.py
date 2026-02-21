@@ -102,8 +102,15 @@ class BlindVideoDenoiserUNet(nn.Module):
             x: Input tensor of shape (B, 9, H, W) containing 3 concatenated RGB frames
         
         Returns:
-            output: Denoised frame of shape (B, 3, H, W)
+            output: Denoised center frame of shape (B, 3, H, W)
+        
+        The network predicts the noise residual, which is subtracted from the
+        noisy center frame. This is easier to learn than direct image prediction
+        because the network only needs to estimate the noise component.
         """
+        # Extract noisy center frame for residual learning (channels 3:6)
+        noisy_center = x[:, 3:6, :, :]
+        
         # Encoder
         x1, skip1 = self.down1(x)
         x2, skip2 = self.down2(x1)
@@ -125,10 +132,11 @@ class BlindVideoDenoiserUNet(nn.Module):
         x = self.up2(x, skip2)
         x = self.up1(x, skip1)
         
-        # Output (no activation for blind denoising)
-        x = self.out_conv(x)
+        # Output: predicted noise residual (no activation)
+        residual = self.out_conv(x)
         
-        return x
+        # Subtract predicted noise from noisy center frame
+        return noisy_center - residual
 
 
 # Example usage
