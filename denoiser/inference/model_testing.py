@@ -58,9 +58,9 @@ class ModelTester:
             denoised = self.model(triplet)
         
         # Convert back to numpy (0-1 range) - clamp to valid range
-        denoised = denoised.squeeze(0).cpu() # back to (9, H, W)
+        denoised = denoised.squeeze(0).cpu() # (3, H, W)
         denoised = torch.clamp(denoised, 0.0, 1.0) # clamping to restrict the changes in pixels and avoid artifacts
-        denoised = denoised.permute(1, 2, 0).numpy().astype(np.float32) # back to (H, W, 9)
+        denoised = denoised.permute(1, 2, 0).numpy().astype(np.float32) # (H, W, 3)
         
         return denoised
     
