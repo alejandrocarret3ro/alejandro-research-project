@@ -264,6 +264,186 @@ class ModelTester:
         plt.show()
 
 
+    def save_video(self, frames, save_path, fps=24):
+        """
+        Save a list of frames as an MP4 video.
+
+        Args:
+            frames: List of numpy arrays (H, W, 3) in [0, 1] float32 range
+            save_path: Output path (e.g., 'output.mp4')
+            fps: Frames per second
+        """
+        import cv2
+
+        h, w = frames[0].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(save_path, fourcc, fps, (w, h))
+
+        for frame in frames:
+            frame_uint8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+            frame_bgr = cv2.cvtColor(frame_uint8, cv2.COLOR_RGB2BGR)
+            writer.write(frame_bgr)
+
+        writer.release()
+        print(f"Video saved: {save_path} ({len(frames)} frames, {fps} fps, {w}x{h})")
+
+    def save_comparison_video(self, clean_frames, noisy_frames, denoised_frames,
+                              save_path, fps=24, label_height=40):
+        """
+        Save a side-by-side comparison video: Noisy | Denoised | Clean.
+        Each panel is labelled at the top.
+
+        Args:
+            clean_frames: List of clean numpy arrays (H, W, 3) in [0, 1]
+            noisy_frames: List of noisy numpy arrays (H, W, 3) in [0, 1]
+            denoised_frames: List of denoised numpy arrays (H, W, 3) in [0, 1]
+            save_path: Output MP4 path
+            fps: Frames per second
+            label_height: Height in pixels for the text label bar
+        """
+        import cv2
+
+        h, w = clean_frames[0].shape[:2]
+        canvas_w = w * 3
+        canvas_h = h + label_height
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(save_path, fourcc, fps, (canvas_w, canvas_h))
+
+        labels = ["Noisy", "Denoised", "Clean"]
+
+        for noisy, denoised, clean in zip(noisy_frames, denoised_frames, clean_frames):
+            # Create canvas
+            canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+
+            # Add label bar (dark background)
+            canvas[:label_height, :, :] = 30  # dark gray
+
+            for i, (label, frame) in enumerate(zip(labels, [noisy, denoised, clean])):
+                # Place frame
+                frame_uint8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+                x_start = i * w
+                canvas[label_height:, x_start:x_start + w, :] = cv2.cvtColor(frame_uint8, cv2.COLOR_RGB2BGR)
+
+                # Add label text
+                text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                text_x = x_start + (w - text_size[0]) // 2
+                text_y = label_height - 12
+                cv2.putText(canvas, label, (text_x, text_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+            writer.write(canvas)
+
+        writer.release()
+        print(f"Comparison video saved: {save_path}")
+        print(f"  Layout: Noisy | Denoised | Clean ({canvas_w}x{canvas_h}, {len(clean_frames)} frames)")
+
+    def denoise_and_save_videos(self, video_folder_path, output_dir, noise_std=50,
+                                 resize_to=(512, 512), fps=24, seed=42):
+        """
+        Full pipeline: load video, add noise, denoise, and save all videos.
+
+        Args:
+            video_folder_path: Path to DAVIS video folder with sequential frames
+            output_dir: Directory to save output videos
+            noise_std: Gaussian noise standard deviation (0-255 scale)
+            resize_to: Processing resolution for the denoiser
+            fps: Output video frame rate
+            seed: Random seed for reproducible noise
+
+        Returns:
+            metrics: Dict with PSNR/SSIM results
+        """
+        video_name = os.path.basename(video_folder_path)
+        os.makedirs(output_dir, exist_ok=True)
+
+        print(f"\n{'='*60}")
+        print(f"Processing video: {video_name} (noise σ={noise_std})")
+        print(f"{'='*60}")
+
+        # 1. Load clean frames
+        frame_files = sorted([
+            f for f in os.listdir(video_folder_path)
+            if f.endswith(('.png', '.jpg', '.jpeg'))
+        ])
+        clean_frames = []
+        for fname in frame_files:
+            img = Image.open(os.path.join(video_folder_path, fname)).convert('RGB')
+            clean_frames.append(np.array(img, dtype=np.float32) / 255.0)
+
+        print(f"Loaded {len(clean_frames)} clean frames")
+
+        # 2. Add noise (seeded for reproducibility)
+        rng = np.random.RandomState(seed)
+        noisy_frames = []
+        for frame in clean_frames:
+            noise = rng.normal(0, noise_std / 255.0, frame.shape).astype(np.float32)
+            noisy_frames.append(np.clip(frame + noise, 0, 1))
+
+        # 3. Denoise frame by frame with temporal context
+        print("Denoising...")
+        denoised_frames = []
+        for i in range(len(noisy_frames)):
+            prev_idx = max(0, i - 1)
+            next_idx = min(len(noisy_frames) - 1, i + 1)
+
+            # Resize for processing
+            prev = self._resize_frame(noisy_frames[prev_idx], resize_to)
+            curr = self._resize_frame(noisy_frames[i], resize_to)
+            nxt = self._resize_frame(noisy_frames[next_idx], resize_to)
+
+            denoised = self.denoise_frame(
+                Image.fromarray((prev * 255).astype(np.uint8)),
+                Image.fromarray((curr * 255).astype(np.uint8)),
+                Image.fromarray((nxt * 255).astype(np.uint8))
+            )
+
+            # Resize back to original resolution
+            orig_h, orig_w = clean_frames[0].shape[:2]
+            denoised_pil = Image.fromarray((denoised * 255).astype(np.uint8))
+            denoised_pil = denoised_pil.resize((orig_w, orig_h), Image.LANCZOS)
+            denoised_frames.append(np.array(denoised_pil, dtype=np.float32) / 255.0)
+
+            if (i + 1) % 20 == 0:
+                print(f"  {i + 1}/{len(noisy_frames)} frames done")
+
+        # 4. Compute metrics
+        metrics = self.compute_metrics(noisy_frames, clean_frames, denoised_frames)
+        print(f"\nPSNR: {metrics['noisy_psnr_mean']:.2f} → {metrics['denoised_psnr_mean']:.2f} dB "
+              f"(+{metrics['psnr_improvement']:.2f})")
+        print(f"SSIM: {metrics['noisy_ssim_mean']:.4f} → {metrics['denoised_ssim_mean']:.4f} "
+              f"(+{metrics['ssim_improvement']:.4f})")
+
+        # 5. Save videos
+        prefix = f"{video_name}_sigma{noise_std}"
+
+        self.save_video(
+            noisy_frames,
+            os.path.join(output_dir, f"{prefix}_noisy.mp4"), fps=fps
+        )
+        self.save_video(
+            denoised_frames,
+            os.path.join(output_dir, f"{prefix}_denoised.mp4"), fps=fps
+        )
+        self.save_video(
+            clean_frames,
+            os.path.join(output_dir, f"{prefix}_clean.mp4"), fps=fps
+        )
+        self.save_comparison_video(
+            clean_frames, noisy_frames, denoised_frames,
+            os.path.join(output_dir, f"{prefix}_comparison.mp4"), fps=fps
+        )
+
+        print(f"\nAll videos saved to {output_dir}")
+        return metrics
+
+    def _resize_frame(self, frame_np, size):
+        """Resize (H, W, 3) float32 [0,1] numpy array to (size[0], size[1])."""
+        pil = Image.fromarray((frame_np * 255).astype(np.uint8))
+        pil = pil.resize((size[1], size[0]), Image.BILINEAR)
+        return np.array(pil, dtype=np.float32) / 255.0
+
+
 def test_on_custom_frames(model_path, frame_paths, device='cuda'):
     """
     Test model on custom frames.
