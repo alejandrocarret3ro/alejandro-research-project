@@ -28,7 +28,7 @@ Important notes on the comparison models:
 - FastDVDNet was trained on noise sigma [5, 55]. It will degrade significantly
   above sigma 55 since it has never seen such noise levels during training.
 - VRT was trained on fixed sigma values (e.g., sigma=30, 50). Similar limitation.
-- This model was trained on sigma [5, 255], so it should handle all ranges.
+- This denoiser model was trained on sigma [5, 255], so it should handle all ranges.
   The benchmark will clearly show where each model's training range matters.
 """
 
@@ -43,134 +43,6 @@ from PIL import Image
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
 from datetime import datetime
-
-
-# ============================================================================
-#  FastDVDNet model definition (self-contained, no external deps needed)
-# ============================================================================
-
-class CvBlock(nn.Module):
-    """Conv2D + BN + ReLU block for FastDVDNet."""
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
-        )
-    def forward(self, x):
-        return self.block(x)
-
-
-class InputCvBlock(nn.Module):
-    """First block: takes concatenated noisy frames + noise map."""
-    def __init__(self, num_in_frames, out_ch):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(num_in_frames * (3 + 1), out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
-        )
-    def forward(self, x):
-        return self.block(x)
-
-
-class DownBlock(nn.Module):
-    """Downsample + 2 conv blocks."""
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.conv1 = CvBlock(in_ch, out_ch)
-        self.conv2 = CvBlock(out_ch, out_ch)
-        self.down = nn.MaxPool2d(2)
-    def forward(self, x):
-        x = self.down(x)
-        x = self.conv1(x)
-        return self.conv2(x)
-
-
-class UpBlock(nn.Module):
-    """Upsample + 2 conv blocks."""
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.conv1 = CvBlock(in_ch, out_ch)
-        self.conv2 = CvBlock(out_ch, out_ch)
-    def forward(self, x, skip):
-        x = self.up(x)
-        x = torch.cat([x, skip], dim=1)
-        x = self.conv1(x)
-        return self.conv2(x)
-
-
-class OutputCvBlock(nn.Module):
-    """Final output block."""
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.block = nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False)
-    def forward(self, x):
-        return self.block(x)
-
-
-class DenBlock(nn.Module):
-    """Denoising UNet block used in FastDVDNet (processes 3 frames)."""
-    def __init__(self, num_in_frames=3):
-        super().__init__()
-        ch = 32
-        self.inc = InputCvBlock(num_in_frames, ch)
-        self.down1 = DownBlock(ch, 2 * ch)
-        self.down2 = DownBlock(2 * ch, 4 * ch)
-        self.up2 = UpBlock(4 * ch + 2 * ch, 2 * ch)
-        self.up1 = UpBlock(2 * ch + ch, ch)
-        self.outc = OutputCvBlock(ch, 3)
-
-    def forward(self, x):
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x = self.up2(x3, x2)
-        x = self.up1(x, x1)
-        return self.outc(x)
-
-
-class FastDVDNet(nn.Module):
-    """
-    FastDVDNet: two-stage UNet for video denoising.
-    Takes 5 consecutive frames + noise sigma map.
-    Stage 1: Denoise (frames 0,1,2) and (frames 2,3,4) separately.
-    Stage 2: Combine both outputs with frame 2 for final denoised frame.
-    """
-    def __init__(self):
-        super().__init__()
-        self.den1 = DenBlock(num_in_frames=3)
-        self.den2 = DenBlock(num_in_frames=3)
-
-    def forward(self, x, noise_map):
-        """
-        Args:
-            x: (B, 5, 3, H, W) — 5 consecutive frames
-            noise_map: (B, 1, H, W) — noise level map (sigma/255)
-        Returns:
-            denoised center frame: (B, 3, H, W)
-        """
-        # Stage 1: process two groups of 3 frames
-        # Group 1: frames 0, 1, 2
-        x0 = torch.cat([x[:, 0], x[:, 1], x[:, 2]], dim=1)  # (B, 9, H, W)
-        nm0 = noise_map.repeat(1, 3, 1, 1)  # (B, 3, H, W) — one per frame
-        inp0 = torch.cat([x0, nm0], dim=1)  # (B, 12, H, W)
-        h0 = self.den1(inp0)
-
-        # Group 2: frames 2, 3, 4
-        x1 = torch.cat([x[:, 2], x[:, 3], x[:, 4]], dim=1)
-        inp1 = torch.cat([x1, nm0], dim=1)
-        h1 = self.den1(inp1)
-
-        # Stage 2: combine with center frame
-        center = x[:, 2]  # (B, 3, H, W)
-        x2 = torch.cat([h0, center, h1], dim=1)  # (B, 9, H, W)
-        nm2 = noise_map.repeat(1, 3, 1, 1)
-        inp2 = torch.cat([x2, nm2], dim=1)  # (B, 12, H, W)
-
-        return self.den2(inp2)
 
 
 # ============================================================================
@@ -227,22 +99,48 @@ class YourDenoiserWrapper:
         return np.array(pil, dtype=np.float32) / 255.0
 
 
-class FastDVDNetWrapper:
-    """Wrapper for FastDVDNet (5-frame temporal + noise map)."""
+# ============================================================================
+#  FastDVDNet — uses official repo code (cloned to /content/fastdvdnet)
+# ============================================================================
 
-    def __init__(self, model_path, device='cuda'):
+class FastDVDNetWrapper:
+    """
+    Wrapper for FastDVDNet using the official repo's model definition.
+    Requires: !git clone https://github.com/m-tassano/fastdvdnet /content/fastdvdnet
+    """
+
+    def __init__(self, repo_path, model_filename='model.pth', device='cuda'):
+        import sys
         self.device = device
         self.name = "FastDVDNet"
-        self.model = FastDVDNet().to(device)
+
+        # Add the repo to sys.path so we can import their model
+        if repo_path not in sys.path:
+            sys.path.insert(0, repo_path)
+
+        from models import FastDVDnet as OfficialFastDVDnet
+
+        self.model = OfficialFastDVDnet(num_input_frames=5)
 
         # Load pretrained weights
+        model_path = os.path.join(repo_path, model_filename)
         state_dict = torch.load(model_path, map_location=device)
-        # Handle different checkpoint formats
-        if isinstance(state_dict, dict) and 'state_dict' in state_dict:
-            state_dict = state_dict['state_dict']
+
+        # Handle DataParallel 'module.' prefix
+        if any(k.startswith('module.') for k in state_dict.keys()):
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
         self.model.load_state_dict(state_dict)
-        self.model.eval()
+        self.model = self.model.to(device).eval()
         print(f"FastDVDNet loaded from {model_path}")
+
+        # Also import their denoising function
+        try:
+            from fastdvdnet import denoise_seq_fastdvdnet
+            self.denoise_seq_fn = denoise_seq_fastdvdnet
+            self.use_official_fn = True
+        except ImportError:
+            self.use_official_fn = False
 
     @torch.no_grad()
     def denoise(self, noisy_frames, noise_sigma, resize_to=(256, 256)):
@@ -254,39 +152,44 @@ class FastDVDNetWrapper:
         Returns:
             list of denoised numpy arrays (H, W, 3) float32 [0, 1]
         """
-        denoised = []
-        n = len(noisy_frames)
+        # Resize all frames
+        frames_resized = [self._resize(f, resize_to) for f in noisy_frames]
 
-        for i in range(n):
-            # Get 5 frames with boundary handling
-            indices = [
-                max(0, i - 2), max(0, i - 1), i,
-                min(n - 1, i + 1), min(n - 1, i + 2)
-            ]
+        # Stack to (N, C, H, W) tensor
+        seq = torch.stack([
+            torch.from_numpy(f).permute(2, 0, 1) for f in frames_resized
+        ]).float().to(self.device)
 
-            frames_resized = []
-            for idx in indices:
-                resized = self._resize(noisy_frames[idx], resize_to)
-                frames_resized.append(resized)
+        # Noise sigma as scalar tensor (normalized to 0-1 range)
+        sigma_tensor = torch.FloatTensor([noise_sigma / 255.0]).to(self.device)
 
-            # Stack to (1, 5, 3, H, W)
-            frames_t = torch.stack([
-                torch.from_numpy(f).permute(2, 0, 1) for f in frames_resized
-            ]).unsqueeze(0).float().to(self.device)
-
-            # Noise map (sigma / 255 as input)
-            noise_map = torch.full(
-                (1, 1, resize_to[0], resize_to[1]),
-                noise_sigma / 255.0,
-                device=self.device
+        if self.use_official_fn:
+            # Use their official denoising function which handles boundary frames
+            out_seq = self.denoise_seq_fn(
+                seq=seq,
+                noise_std=sigma_tensor,
+                temp_psz=5,
+                model_temporal=self.model
             )
+        else:
+            # Manual frame-by-frame fallback
+            n = len(seq)
+            out_seq = torch.empty_like(seq)
+            for i in range(n):
+                indices = [
+                    max(0, i - 2), max(0, i - 1), i,
+                    min(n - 1, i + 1), min(n - 1, i + 2)
+                ]
+                in_frames = seq[indices].unsqueeze(0)  # (1, 5, C, H, W)
+                noise_map = sigma_tensor.expand(1, 1, resize_to[0], resize_to[1])
+                out_seq[i] = self.model(in_frames, noise_map).squeeze(0)
 
-            out = self.model(frames_t, noise_map)
-            out = torch.clamp(out.squeeze(0), 0, 1).cpu().permute(1, 2, 0).numpy()
-
-            # Resize back
+        # Convert back to numpy and resize to original resolution
+        denoised = []
+        for i in range(len(noisy_frames)):
+            frame = torch.clamp(out_seq[i], 0, 1).cpu().permute(1, 2, 0).numpy()
             orig_h, orig_w = noisy_frames[i].shape[:2]
-            out_pil = Image.fromarray((out * 255).astype(np.uint8))
+            out_pil = Image.fromarray((frame * 255).astype(np.uint8))
             out_pil = out_pil.resize((orig_w, orig_h), Image.LANCZOS)
             denoised.append(np.array(out_pil, dtype=np.float32) / 255.0)
 
@@ -978,7 +881,7 @@ Resolution: {results['metadata']['resize_to']}</p>
 def run_benchmark(
     your_model,
     davis_root,
-    fastdvdnet_weights_path=None,
+    fastdvdnet_repo_path=None,
     device='cuda',
     max_videos=5,
     max_frames_per_video=10,
@@ -991,7 +894,7 @@ def run_benchmark(
     Args:
         your_model: Your trained BlindVideoDenoiserUNet (already loaded, eval mode)
         davis_root: Path to DAVIS dataset folder
-        fastdvdnet_weights_path: Path to FastDVDNet model.pth (will skip if None)
+        fastdvdnet_repo_path: Path to cloned FastDVDNet repo (e.g., '/content/fastdvdnet')
         device: 'cuda' or 'cpu'
         max_videos: Number of test videos
         max_frames_per_video: Frames per video
@@ -1006,7 +909,7 @@ def run_benchmark(
         results = run_benchmark(
             your_model=model,
             davis_root='/content/DAVISDataset',
-            fastdvdnet_weights_path='/content/fastdvdnet/model.pth',
+            fastdvdnet_repo_path='/content/fastdvdnet',
             save_dir='/content/drive/MyDrive/ResearchProject/denoiser_evaluation'
         )
     """
@@ -1023,17 +926,17 @@ def run_benchmark(
     your_wrapper = YourDenoiserWrapper(your_model, device=device)
     benchmark.register_denoiser("YourUNet", your_wrapper)
 
-    # Register FastDVDNet if weights available
-    if fastdvdnet_weights_path and os.path.exists(fastdvdnet_weights_path):
+    # Register FastDVDNet if repo available
+    if fastdvdnet_repo_path and os.path.exists(fastdvdnet_repo_path):
         try:
-            fdvd_wrapper = FastDVDNetWrapper(fastdvdnet_weights_path, device=device)
+            fdvd_wrapper = FastDVDNetWrapper(fastdvdnet_repo_path, device=device)
             benchmark.register_denoiser("FastDVDNet", fdvd_wrapper)
         except Exception as e:
             print(f"Warning: Could not load FastDVDNet: {e}")
             print("Continuing without FastDVDNet...")
     else:
-        print(f"FastDVDNet weights not found at {fastdvdnet_weights_path}")
-        print("To include FastDVDNet, download from: https://github.com/m-tassano/fastdvdnet")
+        print(f"FastDVDNet repo not found at {fastdvdnet_repo_path}")
+        print("To include FastDVDNet:")
         print("  !git clone https://github.com/m-tassano/fastdvdnet /content/fastdvdnet")
 
     # Run benchmark
@@ -1078,6 +981,6 @@ if __name__ == "__main__":
     print("  results = run_benchmark(")
     print("      your_model=model,")
     print("      davis_root='/content/DAVISDataset',")
-    print("      fastdvdnet_weights_path='/content/fastdvdnet/model.pth',")
+    print("      fastdvdnet_repo_path='/content/fastdvdnet',")
     print("      save_dir='/content/drive/MyDrive/ResearchProject/denoiser_evaluation'")
     print("  )")
