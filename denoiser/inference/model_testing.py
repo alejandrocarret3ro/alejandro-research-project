@@ -132,7 +132,76 @@ class ModelTester:
             denoised_frames.append(denoised_np)
         
         return denoised_frames, frame_files, original_resolution
-    
+
+    def denoise_noisy_video(self, video_folder_path, noise_std=50,
+                            resize_to=(256, 256), seed=42):
+        """
+        Correct evaluation pipeline: load clean → add noise → denoise noisy frames.
+
+        Unlike denoise_video_folder (which denoises the original clean frames),
+        this method adds synthetic noise first and then denoises the noisy input,
+        which is what you need for proper metric computation and visual comparison.
+
+        All processing (noise addition, denoising, metrics) happens at resize_to
+        resolution to avoid interpolation artifacts in the metrics.
+
+        Args:
+            video_folder_path: Path to DAVIS video folder with sequential frames
+            noise_std: Gaussian noise standard deviation (0-255 scale)
+            resize_to: Resolution for processing (H, W). All outputs at this size.
+            seed: Random seed for reproducible noise
+
+        Returns:
+            clean_frames: List of clean frames at resize_to resolution (float32 [0,1])
+            noisy_frames: List of noisy frames at resize_to resolution (float32 [0,1])
+            denoised_frames: List of denoised frames at resize_to resolution (float32 [0,1])
+            frame_names: List of original frame filenames
+        """
+        # 1. Load and resize clean frames
+        frame_files = sorted([
+            f for f in os.listdir(video_folder_path)
+            if f.endswith(('.png', '.jpg', '.jpeg'))
+        ])
+
+        clean_frames = []
+        for fname in frame_files:
+            img = Image.open(os.path.join(video_folder_path, fname)).convert('RGB')
+            img = img.resize((resize_to[1], resize_to[0]), Image.LANCZOS)
+            clean_frames.append(np.array(img, dtype=np.float32) / 255.0)
+
+        video_name = os.path.basename(video_folder_path)
+        print(f"Loaded {len(clean_frames)} frames from {video_name}")
+        print(f"Processing resolution: {resize_to[1]}x{resize_to[0]}")
+        print(f"Noise σ = {noise_std}")
+
+        # 2. Add noise at processing resolution
+        rng = np.random.RandomState(seed)
+        noisy_frames = []
+        for frame in clean_frames:
+            noise = rng.normal(0, noise_std / 255.0, frame.shape).astype(np.float32)
+            noisy_frames.append(np.clip(frame + noise, 0, 1))
+
+        # 3. Denoise the NOISY frames (not clean)
+        print("Denoising noisy frames...")
+        denoised_frames = []
+        for i in range(len(noisy_frames)):
+            prev_idx = max(0, i - 1)
+            next_idx = min(len(noisy_frames) - 1, i + 1)
+
+            # Frames are already at resize_to — pass directly as PIL
+            prev_pil = Image.fromarray((noisy_frames[prev_idx] * 255).astype(np.uint8))
+            curr_pil = Image.fromarray((noisy_frames[i] * 255).astype(np.uint8))
+            next_pil = Image.fromarray((noisy_frames[next_idx] * 255).astype(np.uint8))
+
+            denoised = self.denoise_frame(prev_pil, curr_pil, next_pil)
+            denoised_frames.append(denoised)
+
+            if (i + 1) % 20 == 0:
+                print(f"  {i + 1}/{len(noisy_frames)} frames done")
+
+        print(f"  Done — {len(denoised_frames)} frames denoised")
+        return clean_frames, noisy_frames, denoised_frames, frame_files
+
     def compute_metrics(self, noisy_frames, clean_frames, denoised_frames, noise_stds=None):
         """
         Compute PSNR and SSIM metrics, optionally normalized by noise level.
