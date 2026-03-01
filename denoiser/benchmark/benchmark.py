@@ -62,8 +62,9 @@ class YourDenoiserWrapper:
         """
         Args:
             noisy_frames: list of numpy arrays (H, W, 3) float32 [0, 1]
+                          Already at the target resolution (pre-resized by benchmark).
             noise_sigma: noise std (0-255 scale, not used by model — it's blind)
-            resize_to: processing resolution
+            resize_to: target resolution (used only if frames differ from this)
         Returns:
             list of denoised numpy arrays (H, W, 3) float32 [0, 1]
         """
@@ -72,10 +73,15 @@ class YourDenoiserWrapper:
             prev_idx = max(0, i - 1)
             next_idx = min(len(noisy_frames) - 1, i + 1)
 
-            # Resize to processing resolution
-            prev = self._resize(noisy_frames[prev_idx], resize_to)
-            curr = self._resize(noisy_frames[i], resize_to)
-            nxt = self._resize(noisy_frames[next_idx], resize_to)
+            prev = noisy_frames[prev_idx]
+            curr = noisy_frames[i]
+            nxt = noisy_frames[next_idx]
+
+            # Resize only if frames are not already at target resolution
+            if curr.shape[0] != resize_to[0] or curr.shape[1] != resize_to[1]:
+                prev = self._resize(prev, resize_to)
+                curr = self._resize(curr, resize_to)
+                nxt = self._resize(nxt, resize_to)
 
             # Build triplet (9, H, W)
             triplet = np.concatenate([prev, curr, nxt], axis=2)  # (H, W, 9)
@@ -83,12 +89,7 @@ class YourDenoiserWrapper:
 
             out = self.model(triplet_t)
             out = torch.clamp(out.squeeze(0), 0, 1).cpu().permute(1, 2, 0).numpy()
-
-            # Resize back to original
-            orig_h, orig_w = noisy_frames[i].shape[:2]
-            out_pil = Image.fromarray((out * 255).astype(np.uint8))
-            out_pil = out_pil.resize((orig_w, orig_h), Image.LANCZOS)
-            denoised.append(np.array(out_pil, dtype=np.float32) / 255.0)
+            denoised.append(out)
 
         return denoised
 
@@ -147,17 +148,23 @@ class FastDVDNetWrapper:
         """
         Args:
             noisy_frames: list of numpy arrays (H, W, 3) float32 [0, 1]
+                          Already at the target resolution (pre-resized by benchmark).
             noise_sigma: noise std (0-255 scale) — FastDVDNet uses this as input
-            resize_to: processing resolution
+            resize_to: target resolution (used only if frames differ)
         Returns:
             list of denoised numpy arrays (H, W, 3) float32 [0, 1]
         """
-        # Resize all frames
-        frames_resized = [self._resize(f, resize_to) for f in noisy_frames]
+        # Resize only if needed
+        frames_ready = []
+        for f in noisy_frames:
+            if f.shape[0] != resize_to[0] or f.shape[1] != resize_to[1]:
+                frames_ready.append(self._resize(f, resize_to))
+            else:
+                frames_ready.append(f)
 
         # Stack to (N, C, H, W) tensor
         seq = torch.stack([
-            torch.from_numpy(f).permute(2, 0, 1) for f in frames_resized
+            torch.from_numpy(f).permute(2, 0, 1) for f in frames_ready
         ]).float().to(self.device)
 
         # Noise sigma as scalar tensor (normalized to 0-1 range)
@@ -174,6 +181,7 @@ class FastDVDNetWrapper:
         else:
             # Manual frame-by-frame fallback
             n = len(seq)
+            h, w = seq.shape[2], seq.shape[3]
             out_seq = torch.empty_like(seq)
             for i in range(n):
                 indices = [
@@ -181,17 +189,14 @@ class FastDVDNetWrapper:
                     min(n - 1, i + 1), min(n - 1, i + 2)
                 ]
                 in_frames = seq[indices].unsqueeze(0)  # (1, 5, C, H, W)
-                noise_map = sigma_tensor.expand(1, 1, resize_to[0], resize_to[1])
+                noise_map = sigma_tensor.expand(1, 1, h, w)
                 out_seq[i] = self.model(in_frames, noise_map).squeeze(0)
 
-        # Convert back to numpy and resize to original resolution
+        # Convert back to numpy (no resize needed — already at target resolution)
         denoised = []
         for i in range(len(noisy_frames)):
             frame = torch.clamp(out_seq[i], 0, 1).cpu().permute(1, 2, 0).numpy()
-            orig_h, orig_w = noisy_frames[i].shape[:2]
-            out_pil = Image.fromarray((frame * 255).astype(np.uint8))
-            out_pil = out_pil.resize((orig_w, orig_h), Image.LANCZOS)
-            denoised.append(np.array(out_pil, dtype=np.float32) / 255.0)
+            denoised.append(frame)
 
         return denoised
 
@@ -272,9 +277,13 @@ class DenoiserBenchmark:
         self.denoisers[name] = wrapper
         print(f"Registered denoiser: {name}")
 
-    def _load_test_videos(self, max_videos=5, max_frames_per_video=10):
+    def _load_test_videos(self, max_videos=5, max_frames_per_video=10, resize_to=None):
         """
         Load a subset of DAVIS videos for benchmarking.
+        If resize_to is provided, frames are resized at load time so that
+        noise addition, denoising, and metric computation all happen at the
+        same resolution — avoiding interpolation artifacts in the metrics.
+
         Returns dict: {video_name: [list of (H,W,3) float32 [0,1] arrays]}
         """
         videos = {}
@@ -296,13 +305,16 @@ class DenoiserBenchmark:
             frames = []
             for fname in frame_files:
                 img = Image.open(os.path.join(video_path, fname)).convert('RGB')
+                if resize_to is not None:
+                    img = img.resize((resize_to[1], resize_to[0]), Image.LANCZOS)
                 frames.append(np.array(img, dtype=np.float32) / 255.0)
 
             if frames:
                 videos[video_name] = frames
 
         total_frames = sum(len(v) for v in videos.values())
-        print(f"Loaded {len(videos)} test videos, {total_frames} total frames")
+        res_str = f"{resize_to[1]}x{resize_to[0]}" if resize_to else "native"
+        print(f"Loaded {len(videos)} test videos, {total_frames} total frames ({res_str})")
         return videos
 
     def _add_noise(self, frames, noise_std, rng):
@@ -355,8 +367,9 @@ class DenoiserBenchmark:
                 prev_results = json.load(f)
             print(f"Loaded previous results from {results_path}")
 
-        # Load test videos
-        videos = self._load_test_videos(max_videos, max_frames_per_video)
+        # Load test videos — resized to benchmark resolution so that
+        # noise, denoising, and metrics all happen at the same resolution
+        videos = self._load_test_videos(max_videos, max_frames_per_video, resize_to=resize_to)
 
         results = {
             'metadata': {
