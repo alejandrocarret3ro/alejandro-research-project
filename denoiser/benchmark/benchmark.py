@@ -221,24 +221,23 @@ class VRTPublishedResults:
 
     def __init__(self):
         self.name = "VRT (published)"
-        # Published values from Table 2 of VRT paper (DAVIS testset)
-        # These are the sigma-specific models
+        # Published values from Table VII of VRT paper (DAVIS testset)
+        # SSIM not published in this table — marked as None
         self.published = {
-            10: {'psnr': 38.20, 'ssim': 0.9669},
-            20: {'psnr': 35.05, 'ssim': 0.9398},
-            30: {'psnr': 33.31, 'ssim': 0.9175},
-            40: {'psnr': 32.04, 'ssim': 0.8976},
-            50: {'psnr': 31.11, 'ssim': 0.8800},
+            10: {'psnr': 40.82, 'ssim': None},
+            20: {'psnr': 38.15, 'ssim': None},
+            30: {'psnr': 36.52, 'ssim': None},
+            40: {'psnr': 35.32, 'ssim': None},
+            50: {'psnr': 34.36, 'ssim': None},
         }
 
     def get_results_for_range(self, low, high):
         """
-        Check if any published sigma falls within [low, high].
-        Returns published values if there's a match, None otherwise.
+        Return published values if this is an exact sigma match.
+        For ranges, returns None (no published data).
         """
-        for sigma, vals in self.published.items():
-            if low <= sigma <= high:
-                return vals
+        if low == high and low in self.published:
+            return self.published[low]
         return None
 
 
@@ -265,11 +264,15 @@ class DenoiserBenchmark:
         self.denoisers = {}
         self.vrt_published = VRTPublishedResults()
 
-        # Define noise ranges (each is [low, high) for uniform sampling)
+        # Noise levels to test:
+        # - Exact sigma values (10, 20, 30, 40, 50) for direct comparison with
+        #   published VRT and FastDVDNet results
+        # - Ranges for higher noise where published results don't exist
+        # Format: (low, high) where low == high means exact sigma
         self.noise_ranges = [
-            (5, 25), (25, 45), (45, 65), (65, 85), (85, 105),
-            (105, 125), (125, 145), (145, 165), (165, 185),
-            (185, 205), (205, 225), (225, 245), (245, 255)
+            (10, 10), (20, 20), (30, 30), (40, 40), (50, 50),
+            (65, 85), (85, 105), (105, 125), (125, 145), (145, 165),
+            (165, 185), (185, 205), (205, 225), (225, 245), (245, 255)
         ]
 
     def register_denoiser(self, name, wrapper):
@@ -389,13 +392,19 @@ class DenoiserBenchmark:
         print(f"{'='*80}\n")
 
         for low, high in self.noise_ranges:
-            range_key = f"{low}-{high}"
-            midpoint_sigma = (low + high) / 2.0
-            print(f"\n--- Noise range σ = [{low}, {high}] (midpoint: {midpoint_sigma:.0f}) ---")
+            is_exact = (low == high)
+            if is_exact:
+                range_key = f"σ={low}"
+                noise_std = float(low)
+                print(f"\n--- Exact noise level σ = {low} ---")
+            else:
+                range_key = f"{low}-{high}"
+                print(f"\n--- Noise range σ = [{low}, {high}] ---")
 
             # Use fixed seed per range for reproducibility
             rng = np.random.RandomState(self.seed + low)
-            noise_std = rng.uniform(low, high)  # Single noise level for this range
+            if not is_exact:
+                noise_std = rng.uniform(low, high)
 
             range_results = {
                 'noise_std_used': float(noise_std),
@@ -451,16 +460,17 @@ class DenoiserBenchmark:
                 range_results['denoisers']['VRT (published)'] = {
                     'psnr': vrt_vals['psnr'],
                     'ssim': vrt_vals['ssim'],
-                    'note': 'Published values from VRT paper Table 2, DAVIS testset'
+                    'note': 'Published values from VRT paper Table VII, DAVIS testset'
                 }
+                ssim_str = f"{vrt_vals['ssim']:.4f}" if vrt_vals['ssim'] is not None else "N/A"
                 print(f"  {'VRT (published)':20s}: PSNR={vrt_vals['psnr']:.2f} dB, "
-                      f"SSIM={vrt_vals['ssim']:.4f} (from paper)")
+                      f"SSIM={ssim_str} (from paper)")
             else:
                 range_results['denoisers']['VRT (published)'] = {
                     'psnr': None, 'ssim': None,
-                    'note': f'No published results for sigma range [{low}, {high}]'
+                    'note': f'No published results for this noise level'
                 }
-                print(f"  {'VRT (published)':20s}: N/A (no published results for this range)")
+                print(f"  {'VRT (published)':20s}: N/A (no published results)")
 
             results['noise_ranges'][range_key] = range_results
 
@@ -506,9 +516,14 @@ class DenoiserBenchmark:
         print(header)
         print("-" * len(header))
 
+        def sort_key(x):
+            """Sort 'σ=10' and '65-85' style keys numerically."""
+            if x.startswith('σ='):
+                return int(x.split('=')[1])
+            return int(x.split('-')[0])
+
         # Rows
-        for range_key in sorted(results['noise_ranges'].keys(),
-                                key=lambda x: int(x.split('-')[0])):
+        for range_key in sorted(results['noise_ranges'].keys(), key=sort_key):
             data = results['noise_ranges'][range_key]
             noisy = data['noisy']
 
@@ -519,7 +534,8 @@ class DenoiserBenchmark:
                 p = d.get('psnr')
                 s = d.get('ssim')
                 if p is not None:
-                    row += f" | {p:>14.2f} | {s:>14.4f}"
+                    s_str = f"{s:>14.4f}" if s is not None else f"{'N/A':>14}"
+                    row += f" | {p:>14.2f} | {s_str}"
                 else:
                     row += f" | {'N/A':>14} | {'N/A':>14}"
 
@@ -548,12 +564,15 @@ class DenoiserBenchmark:
             all_names.update(range_data['denoisers'].keys())
         all_names = sorted(all_names)
 
+        def sort_key(x):
+            if x.startswith('σ='):
+                return int(x.split('=')[1])
+            return int(x.split('-')[0])
+
         sorted_ranges = sorted(
             results['noise_ranges'].keys(),
-            key=lambda x: int(x.split('-')[0])
+            key=sort_key
         )
-
-        # Style definitions
         header_font = Font(bold=True, color="FFFFFF", size=11, name="Arial")
         header_fill = PatternFill("solid", fgColor="2F5496")
         subheader_fill = PatternFill("solid", fgColor="D6E4F0")
@@ -596,7 +615,7 @@ class DenoiserBenchmark:
 
         # Title
         ws_psnr.merge_cells(start_row=1, start_column=1, end_row=1, end_column=2 + len(all_names))
-        ws_psnr.cell(1, 1, "PSNR Comparison (dB) — Higher is Better")
+        ws_psnr.cell(1, 1, "PSNR Comparison (dB)")
         ws_psnr.cell(1, 1).font = Font(bold=True, size=14, name="Arial", color="2F5496")
 
         # Headers
@@ -772,13 +791,18 @@ class DenoiserBenchmark:
             all_names.update(range_data['denoisers'].keys())
         all_names = sorted(all_names)
 
+        def sort_key(x):
+            if x.startswith('σ='):
+                return int(x.split('=')[1])
+            return int(x.split('-')[0])
+
         sorted_ranges = sorted(
             results['noise_ranges'].keys(),
-            key=lambda x: int(x.split('-')[0])
+            key=sort_key
         )
 
         def make_table(metric, title, fmt, higher_better=True):
-            html = f'<h2>{title}</h2>\n<table>\n<tr><th>Noise Range (σ)</th><th>Noisy Baseline</th>'
+            html = f'<h2>{title}</h2>\n<table>\n<tr><th>Noise Level (σ)</th><th>Noisy Baseline</th>'
             for n in all_names:
                 html += f'<th>{n}</th>'
             html += '</tr>\n'
