@@ -241,9 +241,28 @@ class VRTPublishedResults:
         return None
 
 
-# ============================================================================
-#  Benchmark engine
-# ============================================================================
+class FastDVDNetPublishedResults:
+    """
+    Published FastDVDNet results from Table VII of VRT paper (DAVIS testset).
+    Used as a sanity check: if live FastDVDNet results differ wildly from these,
+    something is wrong with our evaluation pipeline.
+    """
+
+    def __init__(self):
+        self.name = "FastDVDNet (published)"
+        # From Table VII of VRT paper, column "FastDVDnet [29]", DAVIS dataset
+        self.published = {
+            10: {'psnr': 38.71, 'ssim': None},
+            20: {'psnr': 35.77, 'ssim': None},
+            30: {'psnr': 34.04, 'ssim': None},
+            40: {'psnr': 32.82, 'ssim': None},
+            50: {'psnr': 31.86, 'ssim': None},
+        }
+
+    def get_results_for_range(self, low, high):
+        if low == high and low in self.published:
+            return self.published[low]
+        return None
 
 class DenoiserBenchmark:
     """
@@ -263,6 +282,7 @@ class DenoiserBenchmark:
         self.seed = seed
         self.denoisers = {}
         self.vrt_published = VRTPublishedResults()
+        self.fastdvdnet_published = FastDVDNetPublishedResults()
 
         # Noise levels to test:
         # - Exact sigma values (10, 20, 30, 40, 50) for direct comparison with
@@ -349,7 +369,7 @@ class DenoiserBenchmark:
             'ssim_std': float(np.std(ssim_vals)),
         }
 
-    def run(self, max_videos=5, max_frames_per_video=10, resize_to=(256, 256),
+    def run(self, max_videos=5, max_frames_per_video=10, resize_to=(480, 856),
             results_path=None):
         """
         Run the full benchmark.
@@ -471,6 +491,22 @@ class DenoiserBenchmark:
                     'note': f'No published results for this noise level'
                 }
                 print(f"  {'VRT (published)':20s}: N/A (no published results)")
+
+            # Add FastDVDNet published results (for sanity-checking live results)
+            fdvd_pub = self.fastdvdnet_published.get_results_for_range(low, high)
+            if fdvd_pub:
+                range_results['denoisers']['FastDVDNet (published)'] = {
+                    'psnr': fdvd_pub['psnr'],
+                    'ssim': fdvd_pub['ssim'],
+                    'note': 'Published values from VRT paper Table VII, DAVIS testset'
+                }
+                print(f"  {'FastDVDNet (pub.)':20s}: PSNR={fdvd_pub['psnr']:.2f} dB (from paper)")
+            else:
+                range_results['denoisers']['FastDVDNet (published)'] = {
+                    'psnr': None, 'ssim': None,
+                    'note': 'No published results for this noise level'
+                }
+                print(f"  {'FastDVDNet (pub.)':20s}: N/A (no published results)")
 
             results['noise_ranges'][range_key] = range_results
 
@@ -922,7 +958,7 @@ def run_benchmark(
     device='cuda',
     max_videos=5,
     max_frames_per_video=10,
-    resize_to=(256, 256),
+    resize_to=(480, 856),
     save_dir='./denoiser_evaluation'
 ):
     """
