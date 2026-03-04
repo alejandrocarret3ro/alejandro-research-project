@@ -335,32 +335,51 @@ class ModelTester:
 
     def save_video(self, frames, save_path, fps=24):
         """
-        Save a list of frames as an MP4 video.
+        Save a list of frames as a high-quality MP4 video using ffmpeg.
 
         Args:
             frames: List of numpy arrays (H, W, 3) in [0, 1] float32 range
             save_path: Output path (e.g., 'output.mp4')
             fps: Frames per second
         """
-        import cv2
+        import subprocess
+        import tempfile
 
         h, w = frames[0].shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(save_path, fourcc, fps, (w, h))
+
+        # Use ffmpeg with raw pipe input for high-quality H.264 encoding
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-pix_fmt', 'rgb24',
+            '-s', f'{w}x{h}',
+            '-r', str(fps),
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-crf', '15',          # Near-lossless quality (0=lossless, 23=default)
+            '-preset', 'slow',      # Better compression at same quality
+            '-pix_fmt', 'yuv444p',  # Full chroma, no subsampling
+            save_path
+        ]
+
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         for frame in frames:
             frame_uint8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
-            frame_bgr = cv2.cvtColor(frame_uint8, cv2.COLOR_RGB2BGR)
-            writer.write(frame_bgr)
+            proc.stdin.write(frame_uint8.tobytes())
 
-        writer.release()
+        proc.stdin.close()
+        proc.wait()
+
         print(f"Video saved: {save_path} ({len(frames)} frames, {fps} fps, {w}x{h})")
 
     def save_comparison_video(self, clean_frames, noisy_frames, denoised_frames,
                               save_path, fps=24, label_height=40):
         """
         Save a side-by-side comparison video: Noisy | Denoised | Clean.
-        Each panel is labelled at the top.
+        Each panel is labelled at the top. Uses ffmpeg for high-quality encoding.
 
         Args:
             clean_frames: List of clean numpy arrays (H, W, 3) in [0, 1]
@@ -371,39 +390,56 @@ class ModelTester:
             label_height: Height in pixels for the text label bar
         """
         import cv2
+        import subprocess
 
         h, w = clean_frames[0].shape[:2]
         canvas_w = w * 3
         canvas_h = h + label_height
 
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(save_path, fourcc, fps, (canvas_w, canvas_h))
-
         labels = ["Noisy", "Denoised", "Clean"]
 
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-pix_fmt', 'rgb24',
+            '-s', f'{canvas_w}x{canvas_h}',
+            '-r', str(fps),
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-crf', '15',
+            '-preset', 'slow',
+            '-pix_fmt', 'yuv444p',
+            save_path
+        ]
+
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
         for noisy, denoised, clean in zip(noisy_frames, denoised_frames, clean_frames):
-            # Create canvas
+            # Create canvas in RGB
             canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
 
             # Add label bar (dark background)
-            canvas[:label_height, :, :] = 30  # dark gray
+            canvas[:label_height, :, :] = 30
 
             for i, (label, frame) in enumerate(zip(labels, [noisy, denoised, clean])):
-                # Place frame
                 frame_uint8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
                 x_start = i * w
-                canvas[label_height:, x_start:x_start + w, :] = cv2.cvtColor(frame_uint8, cv2.COLOR_RGB2BGR)
+                canvas[label_height:, x_start:x_start + w, :] = frame_uint8
 
-                # Add label text
+                # Add label text (need BGR for cv2.putText, then convert back)
                 text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
                 text_x = x_start + (w - text_size[0]) // 2
                 text_y = label_height - 12
                 cv2.putText(canvas, label, (text_x, text_y),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-            writer.write(canvas)
+            proc.stdin.write(canvas.tobytes())
 
-        writer.release()
+        proc.stdin.close()
+        proc.wait()
+
         print(f"Comparison video saved: {save_path}")
         print(f"  Layout: Noisy | Denoised | Clean ({canvas_w}x{canvas_h}, {len(clean_frames)} frames)")
 
