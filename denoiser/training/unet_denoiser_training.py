@@ -23,20 +23,34 @@ class TemporalDenoiseDataset(Dataset):
     - Adds noise directly to the resized image (less memory, less compute)
     - Returns float16 tensors to reduce CPU->GPU transfer time
     - No dependency on external BlindDenoiseDataset — self-contained
+    
+    Noise sampling strategy:
+    - Samples target PSNR uniformly from psnr_range (default [5, 45] dB)
+    - Converts to sigma: σ = 255 / 10^(PSNR/20)
+    - This gives uniform coverage across perceptual noise levels, avoiding
+      the bias toward high-noise images that uniform-σ sampling creates.
     """
-    def __init__(self, frame_data, noise_std_range=(5, 250), resize_to=(256, 256), use_fp16=True):
+    def __init__(self, frame_data, psnr_range=(5, 45), resize_to=(256, 256), use_fp16=True):
         """
         Args:
             frame_data: List of dicts with 'path', 'video', 'frame' keys
-            noise_std_range: (min_std, max_std) for random Gaussian noise (0-255 scale)
+            psnr_range: (min_psnr, max_psnr) in dB for uniform PSNR sampling.
+                        Noise σ is derived as: σ = 255 / 10^(PSNR/20)
+                        Default (5, 45) maps to σ ∈ [~1.4, ~143]
             resize_to: Target resolution (height, width)
             use_fp16: If True, return float16 tensors (faster transfer, less memory)
         """
         self.frame_data = frame_data
-        self.noise_std_range = noise_std_range
+        self.psnr_range = psnr_range
         self.resize_to = resize_to  # (H, W)
         self.use_fp16 = use_fp16
         self.target_size = (resize_to[1], resize_to[0])  # PIL uses (W, H)
+
+        # Log the effective sigma range
+        sigma_low = 255.0 / (10 ** (psnr_range[1] / 20.0))
+        sigma_high = 255.0 / (10 ** (psnr_range[0] / 20.0))
+        print(f"Noise sampling: PSNR ∈ [{psnr_range[0]}, {psnr_range[1]}] dB "
+              f"→ σ ∈ [{sigma_low:.1f}, {sigma_high:.1f}]")
 
         # Group frames by video for temporal triplet construction
         self.videos = {}
@@ -54,6 +68,12 @@ class TemporalDenoiseDataset(Dataset):
                 self.idx_to_video[idx] = video
                 self.idx_to_pos[idx] = pos
 
+    @staticmethod
+    def psnr_to_sigma(psnr_db):
+        """Convert PSNR (dB) to noise standard deviation (0-255 scale).
+        Formula: σ = 255 / 10^(PSNR/20)"""
+        return 255.0 / (10 ** (psnr_db / 20.0))
+
     def _load_and_resize(self, idx):
         """Load a frame from disk and resize it. Returns numpy float32 array (H, W, 3) in 0-255."""
         path = self.frame_data[idx]['path']
@@ -62,8 +82,10 @@ class TemporalDenoiseDataset(Dataset):
         return np.array(img, dtype=np.float32)
 
     def _add_noise(self, image_np):
-        """Add random Gaussian noise. Input/output in 0-255 float32."""
-        noise_std = np.random.uniform(*self.noise_std_range)
+        """Add random Gaussian noise, sampled uniformly in PSNR space.
+        Input/output in 0-255 float32."""
+        target_psnr = np.random.uniform(*self.psnr_range)
+        noise_std = self.psnr_to_sigma(target_psnr)
         noise = np.random.normal(0, noise_std, image_np.shape).astype(np.float32)
         noisy = np.clip(image_np + noise, 0, 255)
         return noisy, noise_std
@@ -183,7 +205,30 @@ class CombinedL1L2Loss(nn.Module):
         l1 = self.l1_loss(pred, target)
         l2 = self.l2_loss(pred, target)
         return self.alpha * l1 + (1 - self.alpha) * l2
+    
 
+class PSNRLoss(nn.Module):
+    """
+    PSNR-inspired loss: -10 * log10(MSE + eps)
+    
+    Minimizing this is equivalent to maximizing PSNR.
+    The logarithmic scale naturally balances gradients across noise levels:
+    small improvements at low noise get the same weight as large improvements
+    at high noise.
+    """
+    def __init__(self, eps=1e-4, max_psnr=50.0):
+        super().__init__()
+        self.eps = eps
+        self.max_psnr = max_psnr
+    
+    def forward(self, pred, target):
+        pred = pred.float()
+        target = target.float()
+        mse = torch.mean((pred - target) ** 2)
+        psnr = -10.0 * torch.log10(mse + self.eps)
+        # Flip: max_psnr - psnr is positive and decreases as quality improves
+        return self.max_psnr - psnr
+    
 
 def train_epoch(model, train_loader, optimizer, criterion, device, scaler=None):
     """Train for one epoch with mixed precision."""
@@ -302,8 +347,10 @@ def train(
         criterion = nn.L1Loss()
     elif loss_type == "combined":
         criterion = CombinedL1L2Loss(alpha=loss_alpha)
+    elif loss_type == 'psnr':
+        criterion = PSNRLoss(eps=1e-8)
     else:
-        raise ValueError(f"Unknown loss type: {loss_type}. Use 'l1', 'l2', or 'combined'")
+        raise ValueError(f"Unknown loss type: {loss_type}. Use 'l1', 'l2', 'psnr' or 'combined'")
 
     # Optimizer
     optimizer = optim.Adam(model.parameters(), lr=initial_lr, weight_decay=1e-5)
@@ -399,7 +446,7 @@ def train(
 
 
 def create_train_val_split(davis_root_dir, val_split=0.2, seed=42,
-                           noise_std_range=(5, 250), resize_to=(256, 256), use_fp16=True):
+                           psnr_range=(5, 45), resize_to=(256, 256), use_fp16=True):
     """
     Create train/val datasets from a single DAVIS folder.
     Returns TemporalDenoiseDataset instances ready for DataLoader.
@@ -408,7 +455,8 @@ def create_train_val_split(davis_root_dir, val_split=0.2, seed=42,
         davis_root_dir: Path to DAVIS JPEGImages folder
         val_split: Fraction of videos to use for validation (0.2 = 20%)
         seed: Random seed for reproducibility
-        noise_std_range: (min_std, max_std) for Gaussian noise
+        psnr_range: (min_psnr, max_psnr) in dB. Noise σ is sampled uniformly
+                    in this PSNR range and converted: σ = 255 / 10^(PSNR/20)
         resize_to: Target resolution (height, width)
         use_fp16: Return float16 tensors for faster data transfer
 
@@ -471,11 +519,11 @@ def create_train_val_split(davis_root_dir, val_split=0.2, seed=42,
 
     # Create datasets directly — no intermediate BlindDenoiseDataset needed
     train_dataset = TemporalDenoiseDataset(
-        train_frames, noise_std_range=noise_std_range,
+        train_frames, psnr_range=psnr_range,
         resize_to=resize_to, use_fp16=use_fp16
     )
     val_dataset = TemporalDenoiseDataset(
-        val_frames, noise_std_range=noise_std_range,
+        val_frames, psnr_range=psnr_range,
         resize_to=resize_to, use_fp16=use_fp16
     )
 

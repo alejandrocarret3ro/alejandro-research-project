@@ -208,61 +208,67 @@ class FastDVDNetWrapper:
 
 class VRTPublishedResults:
     """
-    Uses VRT's published PSNR/SSIM values from the paper instead of running inference.
-
-    VRT is too heavy to run efficiently on Colab (~35M params, requires tiling,
-    custom CUDA ops, and 10+ GB VRAM). Instead, we include their published numbers
-    on DAVIS for the sigma values they tested (10, 20, 30, 40, 50) and mark
-    other noise ranges as N/A.
-
-    Source: Table 2 of "VRT: A Video Restoration Transformer" (arXiv:2201.12288)
-    Dataset: DAVIS testset
+    Published VRT denoising results from Table VII of the VRT paper (DAVIS testset).
+    Stored by sigma, matched to benchmark PSNR levels by finding the closest one.
     """
 
     def __init__(self):
         self.name = "VRT (published)"
         # Published values from Table VII of VRT paper (DAVIS testset)
-        # SSIM not published in this table — marked as None
+        # SSIM not published — marked as None
+        # noisy_psnr = 20*log10(255/sigma), the theoretical noisy baseline
         self.published = {
-            10: {'psnr': 40.82, 'ssim': None},
-            20: {'psnr': 38.15, 'ssim': None},
-            30: {'psnr': 36.52, 'ssim': None},
-            40: {'psnr': 35.32, 'ssim': None},
-            50: {'psnr': 34.36, 'ssim': None},
+            10: {'psnr': 40.82, 'ssim': None, 'noisy_psnr': 28.1},
+            20: {'psnr': 38.15, 'ssim': None, 'noisy_psnr': 22.1},
+            30: {'psnr': 36.52, 'ssim': None, 'noisy_psnr': 18.6},
+            40: {'psnr': 35.32, 'ssim': None, 'noisy_psnr': 16.1},
+            50: {'psnr': 34.36, 'ssim': None, 'noisy_psnr': 14.1},
         }
 
-    def get_results_for_range(self, low, high):
+    def get_results_for_psnr(self, target_psnr, tolerance=1.0):
         """
-        Return published values if this is an exact sigma match.
-        For ranges, returns None (no published data).
+        Return published values if a published sigma's noisy PSNR is within
+        tolerance of the target PSNR level. Returns (result_dict, sigma) or (None, None).
         """
-        if low == high and low in self.published:
-            return self.published[low]
-        return None
+        best_match = None
+        best_sigma = None
+        best_diff = float('inf')
+        for sigma, vals in self.published.items():
+            diff = abs(vals['noisy_psnr'] - target_psnr)
+            if diff < best_diff and diff <= tolerance:
+                best_diff = diff
+                best_match = vals
+                best_sigma = sigma
+        return best_match, best_sigma
 
 
 class FastDVDNetPublishedResults:
     """
     Published FastDVDNet results from Table VII of VRT paper (DAVIS testset).
-    Used as a sanity check: if live FastDVDNet results differ wildly from these,
-    something is wrong with our evaluation pipeline.
+    Used as a sanity check for live FastDVDNet results.
     """
 
     def __init__(self):
         self.name = "FastDVDNet (published)"
-        # From Table VII of VRT paper, column "FastDVDnet [29]", DAVIS dataset
         self.published = {
-            10: {'psnr': 38.71, 'ssim': None},
-            20: {'psnr': 35.77, 'ssim': None},
-            30: {'psnr': 34.04, 'ssim': None},
-            40: {'psnr': 32.82, 'ssim': None},
-            50: {'psnr': 31.86, 'ssim': None},
+            10: {'psnr': 38.71, 'ssim': None, 'noisy_psnr': 28.1},
+            20: {'psnr': 35.77, 'ssim': None, 'noisy_psnr': 22.1},
+            30: {'psnr': 34.04, 'ssim': None, 'noisy_psnr': 18.6},
+            40: {'psnr': 32.82, 'ssim': None, 'noisy_psnr': 16.1},
+            50: {'psnr': 31.86, 'ssim': None, 'noisy_psnr': 14.1},
         }
 
-    def get_results_for_range(self, low, high):
-        if low == high and low in self.published:
-            return self.published[low]
-        return None
+    def get_results_for_psnr(self, target_psnr, tolerance=1.0):
+        best_match = None
+        best_sigma = None
+        best_diff = float('inf')
+        for sigma, vals in self.published.items():
+            diff = abs(vals['noisy_psnr'] - target_psnr)
+            if diff < best_diff and diff <= tolerance:
+                best_diff = diff
+                best_match = vals
+                best_sigma = sigma
+        return best_match, best_sigma
 
 class DenoiserBenchmark:
     """
@@ -285,15 +291,17 @@ class DenoiserBenchmark:
         self.fastdvdnet_published = FastDVDNetPublishedResults()
 
         # Noise levels to test:
-        # - Exact sigma values (10, 20, 30, 40, 50) for direct comparison with
-        #   published VRT and FastDVDNet results
-        # - Ranges for higher noise where published results don't exist
-        # Format: (low, high) where low == high means exact sigma
-        self.noise_ranges = [
-            (10, 10), (20, 20), (30, 30), (40, 40), (50, 50),
-            (65, 85), (85, 105), (105, 125), (125, 145), (145, 165),
-            (165, 185), (185, 205), (205, 225), (225, 245), (245, 255)
-        ]
+        # - PSNR-based levels for uniform perceptual coverage
+        # - VRT/FastDVDNet exact sigmas are included via published results
+        #   matched to the nearest PSNR level
+        #
+        # Format: list of target PSNR values (dB).
+        # σ is derived as: σ = 255 / 10^(PSNR/20)
+        self.target_psnrs = [5, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 34, 38]
+
+        # VRT published results are at specific sigmas; map them to PSNR
+        # σ=10 → 28.1 dB, σ=20 → 22.1 dB, σ=30 → 18.6 dB, σ=40 → 16.1 dB, σ=50 → 14.1 dB
+        # These are close to our PSNR grid points (28, 22, 18, 16, 14)
 
     def register_denoiser(self, name, wrapper):
         """Register a denoiser for benchmarking."""
@@ -402,31 +410,27 @@ class DenoiserBenchmark:
                 'max_frames_per_video': max_frames_per_video,
                 'resize_to': list(resize_to),
                 'seed': self.seed,
-                'noise_ranges': self.noise_ranges,
+                'target_psnrs': self.target_psnrs,
             },
             'noise_ranges': {},
         }
 
         print(f"\n{'='*80}")
-        print(f"BENCHMARK: Comparing {len(self.denoisers)} denoisers across {len(self.noise_ranges)} noise ranges")
+        print(f"BENCHMARK: Comparing {len(self.denoisers)} denoisers across {len(self.target_psnrs)} noise levels")
         print(f"{'='*80}\n")
 
-        for low, high in self.noise_ranges:
-            is_exact = (low == high)
-            if is_exact:
-                range_key = f"σ={low}"
-                noise_std = float(low)
-                print(f"\n--- Exact noise level σ = {low} ---")
-            else:
-                range_key = f"{low}-{high}"
-                print(f"\n--- Noise range σ = [{low}, {high}] ---")
+        for target_psnr in self.target_psnrs:
+            # Convert PSNR to sigma: σ = 255 / 10^(PSNR/20)
+            noise_std = 255.0 / (10 ** (target_psnr / 20.0))
+            range_key = f"PSNR={target_psnr}dB"
 
-            # Use fixed seed per range for reproducibility
-            rng = np.random.RandomState(self.seed + low)
-            if not is_exact:
-                noise_std = rng.uniform(low, high)
+            print(f"\n--- Noisy PSNR ≈ {target_psnr} dB (σ ≈ {noise_std:.1f}) ---")
+
+            # Use fixed seed per level for reproducibility
+            rng = np.random.RandomState(self.seed + target_psnr)
 
             range_results = {
+                'target_psnr': target_psnr,
                 'noise_std_used': float(noise_std),
                 'noisy': None,
                 'denoisers': {},
@@ -474,39 +478,37 @@ class DenoiserBenchmark:
                     print(f"  {name:20s}: ERROR — {e}")
                     range_results['denoisers'][name] = {'error': str(e)}
 
-            # Add VRT published results
-            vrt_vals = self.vrt_published.get_results_for_range(low, high)
+            # Add VRT published results (matched by PSNR proximity)
+            vrt_vals, vrt_sigma = self.vrt_published.get_results_for_psnr(target_psnr)
             if vrt_vals:
                 range_results['denoisers']['VRT (published)'] = {
                     'psnr': vrt_vals['psnr'],
                     'ssim': vrt_vals['ssim'],
-                    'note': 'Published values from VRT paper Table VII, DAVIS testset'
+                    'note': f'Published at σ={vrt_sigma}, Table VII, DAVIS'
                 }
-                ssim_str = f"{vrt_vals['ssim']:.4f}" if vrt_vals['ssim'] is not None else "N/A"
-                print(f"  {'VRT (published)':20s}: PSNR={vrt_vals['psnr']:.2f} dB, "
-                      f"SSIM={ssim_str} (from paper)")
+                print(f"  {'VRT (published)':20s}: PSNR={vrt_vals['psnr']:.2f} dB (from paper, σ={vrt_sigma})")
             else:
                 range_results['denoisers']['VRT (published)'] = {
                     'psnr': None, 'ssim': None,
-                    'note': f'No published results for this noise level'
+                    'note': 'No published results near this noise level'
                 }
-                print(f"  {'VRT (published)':20s}: N/A (no published results)")
+                print(f"  {'VRT (published)':20s}: N/A")
 
-            # Add FastDVDNet published results (for sanity-checking live results)
-            fdvd_pub = self.fastdvdnet_published.get_results_for_range(low, high)
-            if fdvd_pub:
+            # Add FastDVDNet published results
+            fdvd_vals, fdvd_sigma = self.fastdvdnet_published.get_results_for_psnr(target_psnr)
+            if fdvd_vals:
                 range_results['denoisers']['FastDVDNet (published)'] = {
-                    'psnr': fdvd_pub['psnr'],
-                    'ssim': fdvd_pub['ssim'],
-                    'note': 'Published values from VRT paper Table VII, DAVIS testset'
+                    'psnr': fdvd_vals['psnr'],
+                    'ssim': fdvd_vals['ssim'],
+                    'note': f'Published at σ={fdvd_sigma}, Table VII, DAVIS'
                 }
-                print(f"  {'FastDVDNet (pub.)':20s}: PSNR={fdvd_pub['psnr']:.2f} dB (from paper)")
+                print(f"  {'FastDVDNet (pub.)':20s}: PSNR={fdvd_vals['psnr']:.2f} dB (from paper, σ={fdvd_sigma})")
             else:
                 range_results['denoisers']['FastDVDNet (published)'] = {
                     'psnr': None, 'ssim': None,
-                    'note': 'No published results for this noise level'
+                    'note': 'No published results near this noise level'
                 }
-                print(f"  {'FastDVDNet (pub.)':20s}: N/A (no published results)")
+                print(f"  {'FastDVDNet (pub.)':20s}: N/A")
 
             results['noise_ranges'][range_key] = range_results
 
@@ -545,7 +547,7 @@ class DenoiserBenchmark:
         all_names = sorted(all_names)
 
         # Header
-        header = f"{'Noise Range':>12} | {'Noisy PSNR':>10} | {'Noisy SSIM':>10}"
+        header = f"{'Noise Level':>16} | {'σ':>6} | {'Noisy PSNR':>10} | {'Noisy SSIM':>10}"
         for name in all_names:
             short = name[:12]
             header += f" | {short + ' PSNR':>14} | {short + ' SSIM':>14}"
@@ -553,17 +555,20 @@ class DenoiserBenchmark:
         print("-" * len(header))
 
         def sort_key(x):
-            """Sort 'σ=10' and '65-85' style keys numerically."""
+            """Sort 'PSNR=10dB' keys numerically (descending PSNR = ascending noise)."""
+            if x.startswith('PSNR='):
+                return int(x.split('=')[1].replace('dB', ''))
             if x.startswith('σ='):
                 return int(x.split('=')[1])
             return int(x.split('-')[0])
 
-        # Rows
-        for range_key in sorted(results['noise_ranges'].keys(), key=sort_key):
+        # Rows — sort by PSNR descending (low noise first)
+        for range_key in sorted(results['noise_ranges'].keys(), key=sort_key, reverse=True):
             data = results['noise_ranges'][range_key]
             noisy = data['noisy']
+            sigma = data.get('noise_std_used', 0)
 
-            row = f"  σ {range_key:>8} | {noisy['psnr']:>10.2f} | {noisy['ssim']:>10.4f}"
+            row = f"  {range_key:>14} | {sigma:>6.1f} | {noisy['psnr']:>10.2f} | {noisy['ssim']:>10.4f}"
 
             for name in all_names:
                 d = data['denoisers'].get(name, {})
@@ -601,14 +606,18 @@ class DenoiserBenchmark:
         all_names = sorted(all_names)
 
         def sort_key(x):
+            if x.startswith('PSNR='):
+                return int(x.split('=')[1].replace('dB', ''))
             if x.startswith('σ='):
                 return int(x.split('=')[1])
             return int(x.split('-')[0])
 
         sorted_ranges = sorted(
             results['noise_ranges'].keys(),
-            key=sort_key
+            key=sort_key,
+            reverse=True  # High PSNR (low noise) first
         )
+        # Style definitions
         header_font = Font(bold=True, color="FFFFFF", size=11, name="Arial")
         header_fill = PatternFill("solid", fgColor="2F5496")
         subheader_fill = PatternFill("solid", fgColor="D6E4F0")
@@ -655,7 +664,7 @@ class DenoiserBenchmark:
         ws_psnr.cell(1, 1).font = Font(bold=True, size=14, name="Arial", color="2F5496")
 
         # Headers
-        headers = ["Noise Range (σ)", "Noisy Baseline"] + all_names
+        headers = ["Noise Level", "σ", "Noisy Baseline"] + all_names
         for c, h in enumerate(headers, 1):
             ws_psnr.cell(3, c, h)
         style_header(ws_psnr, 3, len(headers))
@@ -667,8 +676,12 @@ class DenoiserBenchmark:
             ws_psnr.cell(r, 1).alignment = center
             ws_psnr.cell(r, 1).border = thin_border
 
-            ws_psnr.cell(r, 2, round(data['noisy']['psnr'], 2))
+            sigma = data.get('noise_std_used', 0)
+            ws_psnr.cell(r, 2, round(sigma, 1))
             style_data_cell(ws_psnr, r, 2)
+
+            ws_psnr.cell(r, 3, round(data['noisy']['psnr'], 2))
+            style_data_cell(ws_psnr, r, 3)
 
             # Find best PSNR for this range
             psnr_vals = {}
@@ -679,7 +692,7 @@ class DenoiserBenchmark:
                     psnr_vals[name] = p
             best_name = max(psnr_vals, key=psnr_vals.get) if psnr_vals else None
 
-            for c, name in enumerate(all_names, 3):
+            for c, name in enumerate(all_names, 4):
                 d = data['denoisers'].get(name, {})
                 p = d.get('psnr')
                 if p is not None:
@@ -700,7 +713,7 @@ class DenoiserBenchmark:
         ws_ssim.cell(1, 1, "SSIM Comparison — Higher is Better (max 1.0)")
         ws_ssim.cell(1, 1).font = Font(bold=True, size=14, name="Arial", color="2F5496")
 
-        headers_ssim = ["Noise Range (σ)", "Noisy Baseline"] + all_names
+        headers_ssim = ["Noise Level", "σ", "Noisy Baseline"] + all_names
         for c, h in enumerate(headers_ssim, 1):
             ws_ssim.cell(3, c, h)
         style_header(ws_ssim, 3, len(headers_ssim))
@@ -712,8 +725,12 @@ class DenoiserBenchmark:
             ws_ssim.cell(r, 1).alignment = center
             ws_ssim.cell(r, 1).border = thin_border
 
-            ws_ssim.cell(r, 2, round(data['noisy']['ssim'], 4))
+            sigma = data.get('noise_std_used', 0)
+            ws_ssim.cell(r, 2, round(sigma, 1))
             style_data_cell(ws_ssim, r, 2)
+
+            ws_ssim.cell(r, 3, round(data['noisy']['ssim'], 4))
+            style_data_cell(ws_ssim, r, 3)
 
             ssim_vals = {}
             for name in all_names:
@@ -723,7 +740,7 @@ class DenoiserBenchmark:
                     ssim_vals[name] = s
             best_name = max(ssim_vals, key=ssim_vals.get) if ssim_vals else None
 
-            for c, name in enumerate(all_names, 3):
+            for c, name in enumerate(all_names, 4):
                 d = data['denoisers'].get(name, {})
                 s = d.get('ssim')
                 if s is not None:
@@ -744,7 +761,7 @@ class DenoiserBenchmark:
         ws_gain.cell(1, 1, "PSNR Improvement over Noisy Baseline (dB)")
         ws_gain.cell(1, 1).font = Font(bold=True, size=14, name="Arial", color="2F5496")
 
-        headers_gain = ["Noise Range (σ)"] + all_names
+        headers_gain = ["Noise Level", "σ"] + all_names
         for c, h in enumerate(headers_gain, 1):
             ws_gain.cell(3, c, h)
         style_header(ws_gain, 3, len(headers_gain))
@@ -758,6 +775,10 @@ class DenoiserBenchmark:
             ws_gain.cell(r, 1).alignment = center
             ws_gain.cell(r, 1).border = thin_border
 
+            sigma = data.get('noise_std_used', 0)
+            ws_gain.cell(r, 2, round(sigma, 1))
+            style_data_cell(ws_gain, r, 2)
+
             gain_vals = {}
             for name in all_names:
                 d = data['denoisers'].get(name, {})
@@ -766,7 +787,7 @@ class DenoiserBenchmark:
                     gain_vals[name] = p - noisy_psnr
             best_name = max(gain_vals, key=gain_vals.get) if gain_vals else None
 
-            for c, name in enumerate(all_names, 2):
+            for c, name in enumerate(all_names, 3):
                 d = data['denoisers'].get(name, {})
                 p = d.get('psnr')
                 if p is not None:
@@ -798,11 +819,13 @@ class DenoiserBenchmark:
             ["PSNR Gain", "Improvement in PSNR over the noisy input (no denoising). Shows how much each denoiser helps."],
             [""],
             ["Model Notes:"],
-            ["YourUNet", "Your blind denoiser trained on σ ∈ [5, 255]. Handles all noise levels."],
+            ["YourUNet", "Your blind denoiser. Noise sampled uniformly in PSNR space for balanced training."],
             ["FastDVDNet", "Trained on σ ∈ [5, 55]. Uses noise sigma as input. Degrades above σ ≈ 55."],
-            ["VRT (published)", "Published results from the VRT paper (Table 2). Only available for σ = 10, 20, 30, 40, 50."],
+            ["VRT (published)", "Published PSNR from VRT paper Table VII, DAVIS. Only available for σ = 10, 20, 30, 40, 50."],
+            ["FastDVDNet (published)", "Published PSNR from VRT paper Table VII, DAVIS. Sanity check for live results."],
             [""],
-            ["Green-highlighted cells indicate the best performer for each noise range."],
+            ["Noise levels are specified by target noisy PSNR. σ = 255 / 10^(PSNR/20)."],
+            ["Green-highlighted cells indicate the best performer for each noise level."],
         ]
         for r, row_data in enumerate(notes, 1):
             for c, val in enumerate(row_data, 1):
@@ -828,17 +851,20 @@ class DenoiserBenchmark:
         all_names = sorted(all_names)
 
         def sort_key(x):
+            if x.startswith('PSNR='):
+                return int(x.split('=')[1].replace('dB', ''))
             if x.startswith('σ='):
                 return int(x.split('=')[1])
             return int(x.split('-')[0])
 
         sorted_ranges = sorted(
             results['noise_ranges'].keys(),
-            key=sort_key
+            key=sort_key,
+            reverse=True
         )
 
         def make_table(metric, title, fmt, higher_better=True):
-            html = f'<h2>{title}</h2>\n<table>\n<tr><th>Noise Level (σ)</th><th>Noisy Baseline</th>'
+            html = f'<h2>{title}</h2>\n<table>\n<tr><th>Noise Level</th><th>σ</th><th>Noisy Baseline</th>'
             for n in all_names:
                 html += f'<th>{n}</th>'
             html += '</tr>\n'
@@ -846,7 +872,8 @@ class DenoiserBenchmark:
             for rk in sorted_ranges:
                 data = results['noise_ranges'][rk]
                 noisy_val = data['noisy'].get(metric)
-                html += f'<tr><td class="range">{rk}</td><td>{noisy_val:{fmt}}</td>'
+                sigma = data.get('noise_std_used', 0)
+                html += f'<tr><td class="range">{rk}</td><td>{sigma:.1f}</td><td>{noisy_val:{fmt}}</td>'
 
                 # Find best
                 vals = {}
@@ -933,10 +960,12 @@ Resolution: {results['metadata']['resize_to']}</p>
         html += """
 <div class="notes">
 <h2>Notes</h2>
-<p><strong>YourUNet:</strong> Blind denoiser trained on σ ∈ [5, 255]. Handles all noise levels without knowing the noise level.</p>
+<p><strong>Noise levels</strong> are specified by target noisy PSNR (dB). The corresponding σ is derived as: σ = 255 / 10^(PSNR/20).</p>
+<p><strong>YourUNet:</strong> Blind denoiser trained with noise sampled uniformly in PSNR space for balanced perceptual coverage.</p>
 <p><strong>FastDVDNet:</strong> Trained on σ ∈ [5, 55] and requires noise sigma as input. Expected to degrade significantly above σ ≈ 55.</p>
-<p><strong>VRT (published):</strong> State-of-the-art transformer model. Results taken from published paper (Table 2, DAVIS testset). Only tested at σ = 10, 20, 30, 40, 50.</p>
-<p><strong>Green cells</strong> indicate the best performer for each noise range.</p>
+<p><strong>VRT (published):</strong> State-of-the-art transformer model. PSNR from Table VII of VRT paper (DAVIS testset). Matched to nearest PSNR level.</p>
+<p><strong>FastDVDNet (published):</strong> Published PSNR from Table VII of VRT paper. Used as sanity check for live FastDVDNet results.</p>
+<p><strong>Green cells</strong> indicate the best performer for each noise level.</p>
 <p><strong>PSNR:</strong> Peak Signal-to-Noise Ratio — measures pixel-level accuracy in decibels. Higher is better.</p>
 <p><strong>SSIM:</strong> Structural Similarity Index — measures perceptual quality (0 to 1). Higher is better.</p>
 </div>
