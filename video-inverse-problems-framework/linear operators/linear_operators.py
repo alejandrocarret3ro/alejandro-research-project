@@ -1,13 +1,12 @@
 """
 Linear operators for video inverse problems.
 
-Currently focused on demosaicing (Bayer pattern).
-Demosaicing is structurally identical to inpainting: the forward operator is a
-per-channel binary mask determined by the Bayer color filter array (CFA).
-
-For the Kadkhodaie & Simoncelli algorithm, the key property is that
-project(x) = A^T(A(x)) is an exact projection. This holds perfectly for
-demosaicing since the mask is diagonal.
+Supported operators:
+- DemosaicingOperator: Bayer CFA pattern (exact projection)
+- SuperResolutionOperator: Downsampling by integer factor (approximate projection)
+- DeblurringOperator: Convolution with known blur kernel (NOT a projection —
+  requires PnPSolver instead of KadkhodaieSolver)
+- InpaintingOperator: Binary mask zeroing out a rectangular region (exact projection)
 """
 
 import torch
@@ -16,137 +15,260 @@ import numpy as np
 from inverse_problem_framework import LinearOperator
 
 
+# ============================================================
+# Demosaicing Operator
+# ============================================================
+
 class DemosaicingOperator(LinearOperator):
     """
     Demosaicing (Bayer CFA) operator.
-
-    Forward model: each pixel location observes exactly ONE color channel
-    according to the Bayer pattern. The other two channels are zeroed out.
-
-    For an RGGB pattern on a 4x4 block:
-        R G R G ...      Channel 0 (R): 1 0 1 0 / 0 0 0 0 / ...
-        G B G B ...      Channel 1 (G): 0 1 0 1 / 1 0 1 0 / ...
-        R G R G ...      Channel 2 (B): 0 0 0 0 / 0 1 0 1 / ...
-        G B G B ...
-
-    The mask has shape (1, 3, H, W) — one binary mask per channel.
-    Each spatial location has exactly one channel set to 1.
-
-    This is mathematically identical to inpainting: y = mask * x,
-    so project(x) = mask * x is an exact projection, and the
-    standard KadkhodaieSolver works directly.
+    Forward model: each pixel sees exactly ONE color channel (Bayer mask).
     """
 
     def __init__(self, H: int, W: int, pattern: str = 'RGGB', device: str = 'cuda'):
-        """
-        Args:
-            H: Frame height (must be even)
-            W: Frame width (must be even)
-            pattern: Bayer pattern string. One of 'RGGB', 'BGGR', 'GRBG', 'GBRG'.
-            device: 'cuda' or 'cpu'
-        """
         assert H % 2 == 0 and W % 2 == 0, "H and W must be even for Bayer pattern"
         self.device = device
         self.H = H
         self.W = W
         self.pattern = pattern
-
-        # Build the (1, 3, H, W) Bayer mask
         self.mask = self._build_bayer_mask(H, W, pattern).to(device)
 
-    def _build_bayer_mask(self, H: int, W: int, pattern: str) -> torch.Tensor:
-        """
-        Build a Bayer CFA mask of shape (1, 3, H, W).
-        Each spatial position (i, j) has exactly one channel == 1.
-        """
+    def _build_bayer_mask(self, H, W, pattern):
         mask = torch.zeros(1, 3, H, W)
-
-        # Map pattern string to 2x2 channel indices
         color_map = {'R': 0, 'G': 1, 'B': 2}
-        tl = color_map[pattern[0]]  # top-left
-        tr = color_map[pattern[1]]  # top-right
-        bl = color_map[pattern[2]]  # bottom-left
-        br = color_map[pattern[3]]  # bottom-right
-
-        # Fill the mask by tiling the 2x2 pattern
-        mask[0, tl, 0::2, 0::2] = 1.0  # top-left positions
-        mask[0, tr, 0::2, 1::2] = 1.0  # top-right positions
-        mask[0, bl, 1::2, 0::2] = 1.0  # bottom-left positions
-        mask[0, br, 1::2, 1::2] = 1.0  # bottom-right positions
-
+        tl, tr = color_map[pattern[0]], color_map[pattern[1]]
+        bl, br = color_map[pattern[2]], color_map[pattern[3]]
+        mask[0, tl, 0::2, 0::2] = 1.0
+        mask[0, tr, 0::2, 1::2] = 1.0
+        mask[0, bl, 1::2, 0::2] = 1.0
+        mask[0, br, 1::2, 1::2] = 1.0
         return mask
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Apply Bayer CFA: keep only the observed channel at each pixel.
-        Args: x: (T, 3, H, W) or (3, H, W) full RGB video/frame
-        Returns: y: same shape, with unobserved channels zeroed out
-        """
-        return x * self.mask
+    def forward(self, x): return x * self.mask
+    def adjoint(self, y): return y * self.mask
+    def project(self, x): return x * self.mask
+    def null_project(self, x): return x * (1.0 - self.mask)
 
-    def adjoint(self, y: torch.Tensor) -> torch.Tensor:
-        """Adjoint is the same as forward for a diagonal binary mask."""
-        return y * self.mask
-
-    def project(self, x: torch.Tensor) -> torch.Tensor:
-        """Project onto CFA-observed subspace."""
-        return x * self.mask
-
-    def null_project(self, x: torch.Tensor) -> torch.Tensor:
-        """Project onto the unobserved (missing) subspace."""
-        return x * (1.0 - self.mask)
-
-    def mosaic_to_rgb_nearest(self, mosaiced: torch.Tensor) -> torch.Tensor:
-        """
-        Simple nearest-neighbor demosaicing for baseline comparison.
-        NOT used by the solver — just for creating a naive baseline.
-
-        Args: mosaiced: (T, 3, H, W) CFA-masked image
-        Returns: demosaiced: (T, 3, H, W) naive interpolation
-        """
+    def mosaic_to_rgb_nearest(self, mosaiced):
         result = mosaiced.clone()
-        kernel_size = 3
-        pad = kernel_size // 2
-
+        kernel_size, pad = 3, 1
         for c in range(3):
-            channel_mask = self.mask[0, c]  # (H, W)
-            channel_data = mosaiced[:, c]   # (T, H, W)
-
-            observed = channel_data * channel_mask.unsqueeze(0)
-            observed_4d = observed.unsqueeze(1)
-            mask_4d = channel_mask.unsqueeze(0).unsqueeze(0).expand(
-                observed_4d.shape[0], -1, -1, -1
-            )
-
-            sum_vals = F.avg_pool2d(
-                F.pad(observed_4d, (pad, pad, pad, pad), mode='reflect'),
-                kernel_size, stride=1
-            ) * (kernel_size ** 2)
-            sum_mask = F.avg_pool2d(
-                F.pad(mask_4d, (pad, pad, pad, pad), mode='reflect'),
-                kernel_size, stride=1
-            ) * (kernel_size ** 2)
-
-            interpolated = sum_vals / (sum_mask + 1e-8)
-            interpolated = interpolated.squeeze(1)
-
-            result[:, c] = (channel_data * channel_mask.unsqueeze(0) +
-                            interpolated * (1 - channel_mask.unsqueeze(0)))
-
+            cm, cd = self.mask[0, c], mosaiced[:, c]
+            obs = (cd * cm.unsqueeze(0)).unsqueeze(1)
+            m4 = cm.unsqueeze(0).unsqueeze(0).expand(obs.shape[0], -1, -1, -1)
+            sv = F.avg_pool2d(F.pad(obs, (pad,pad,pad,pad), mode='reflect'), kernel_size, stride=1) * 9
+            sm = F.avg_pool2d(F.pad(m4, (pad,pad,pad,pad), mode='reflect'), kernel_size, stride=1) * 9
+            interp = (sv / (sm + 1e-8)).squeeze(1)
+            result[:, c] = cd * cm.unsqueeze(0) + interp * (1 - cm.unsqueeze(0))
         return result
 
 
-def create_bayer_mosaic(clean_video: torch.Tensor, H: int, W: int,
-                        pattern: str = 'RGGB', device: str = 'cuda'):
+def create_bayer_mosaic(clean_video, H, W, pattern='RGGB', device='cuda'):
+    op = DemosaicingOperator(H, W, pattern=pattern, device=device)
+    mos = op.forward(clean_video)
+    naive = op.mosaic_to_rgb_nearest(mos)
+    return op, mos, naive
+
+
+# ============================================================
+# Super-Resolution Operator
+# ============================================================
+
+class SuperResolutionOperator(LinearOperator):
     """
-    Convenience function: create a mosaiced video from a clean video.
+    Super-resolution: y = downsample(x) via average pooling.
+    Adjoint: nearest-neighbor upsample.
+    project(x) = upsample(downsample(x)) — approximate projection.
+    """
+
+    def __init__(self, scale_factor: int = 2, device: str = 'cuda'):
+        self.device = device
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        if x.dim() == 3:
+            return F.avg_pool2d(x.unsqueeze(0), self.scale_factor).squeeze(0)
+        return F.avg_pool2d(x, self.scale_factor)
+
+    def adjoint(self, y):
+        if y.dim() == 3:
+            return F.interpolate(y.unsqueeze(0), scale_factor=self.scale_factor,
+                                 mode='nearest').squeeze(0)
+        return F.interpolate(y, scale_factor=self.scale_factor, mode='nearest')
+
+    def project(self, x):
+        return self.adjoint(self.forward(x))
+
+    def null_project(self, x):
+        return x - self.project(x)
+
+
+def create_sr_degradation(clean_video, scale_factor=2, device='cuda'):
+    op = SuperResolutionOperator(scale_factor=scale_factor, device=device)
+    lr = op.forward(clean_video)
+    lr_up = op.adjoint(lr)
+    if lr.dim() == 4:
+        bi_up = F.interpolate(lr, scale_factor=scale_factor, mode='bilinear', align_corners=False)
+    else:
+        bi_up = F.interpolate(lr.unsqueeze(0), scale_factor=scale_factor,
+                              mode='bilinear', align_corners=False).squeeze(0)
+    return op, lr, lr_up, bi_up
+
+
+# ============================================================
+# Deblurring Operator
+# ============================================================
+
+class DeblurringOperator(LinearOperator):
+    """
+    Deblurring operator: y = blur(x) = conv(x, kernel).
+    Forward: convolution with a known blur kernel.
+    Adjoint: correlation = convolution with flipped kernel.
+    NOT a projection — use PnPSolver.
+    """
+
+    def __init__(self, kernel: torch.Tensor, device: str = 'cuda'):
+        self.device = device
+        if kernel.dim() == 2:
+            kernel = kernel.unsqueeze(0).unsqueeze(0)
+        self.kernel = (kernel / (kernel.sum() + 1e-8)).to(device)
+        self.padding = (self.kernel.shape[2] // 2, self.kernel.shape[3] // 2)
+
+    def forward(self, x):
+        if x.dim() == 3:
+            C, H, W = x.shape
+            return F.conv2d(x.reshape(C, 1, H, W), self.kernel,
+                            padding=self.padding).reshape(C, H, W)
+        T, C, H, W = x.shape
+        return F.conv2d(x.reshape(T * C, 1, H, W), self.kernel,
+                        padding=self.padding).reshape(T, C, H, W)
+
+    def adjoint(self, y):
+        k_flip = torch.flip(self.kernel, [2, 3])
+        if y.dim() == 3:
+            C, H, W = y.shape
+            return F.conv2d(y.reshape(C, 1, H, W), k_flip,
+                            padding=self.padding).reshape(C, H, W)
+        T, C, H, W = y.shape
+        return F.conv2d(y.reshape(T * C, 1, H, W), k_flip,
+                        padding=self.padding).reshape(T, C, H, W)
+
+
+def create_gaussian_blur_kernel(kernel_size, sigma=1.0):
+    x = torch.arange(kernel_size).float() - kernel_size // 2
+    gauss = torch.exp(-(x ** 2) / (2 * sigma ** 2))
+    kernel = gauss.unsqueeze(1) * gauss.unsqueeze(0)
+    return (kernel / kernel.sum()).unsqueeze(0).unsqueeze(0)
+
+
+def create_motion_blur_kernel(kernel_size, angle=0.0):
+    kernel = torch.zeros(kernel_size, kernel_size)
+    center = kernel_size // 2
+    for i in range(kernel_size):
+        offset = i - center
+        xi = int(center + offset * np.cos(np.radians(angle)))
+        yi = int(center + offset * np.sin(np.radians(angle)))
+        if 0 <= xi < kernel_size and 0 <= yi < kernel_size:
+            kernel[yi, xi] = 1.0
+    return (kernel / (kernel.sum() + 1e-8)).unsqueeze(0).unsqueeze(0)
+
+
+def create_blur_degradation(clean_video, kernel, device='cuda'):
+    operator = DeblurringOperator(kernel, device=device)
+    blurred = operator.forward(clean_video)
+    naive_deblurred = torch.clamp(operator.adjoint(blurred), 0, 1)
+    return operator, blurred, naive_deblurred
+
+
+# ============================================================
+# Inpainting Operator
+# ============================================================
+
+class InpaintingOperator(LinearOperator):
+    """
+    Inpainting operator: y = mask * x.
+
+    A binary mask where 1 = observed (kept) and 0 = missing (to be filled in).
+    The missing region is typically a centered rectangle, as in Kadkhodaie (2021).
+
+    The mask has shape (1, 1, H, W) — same mask applied to all 3 RGB channels.
+    This is an exact projection: project(x) = mask * x, applying it twice
+    gives the same result. The KadkhodaieSolver works directly.
+
+    The algorithm keeps the observed pixels fixed and uses the denoiser's
+    implicit prior to fill in the missing rectangle with natural-looking content.
+    """
+
+    def __init__(self, mask: torch.Tensor, device: str = 'cuda'):
+        """
+        Args:
+            mask: Binary mask. Shape (H, W), (1, 1, H, W), or (1, C, H, W).
+                  1 = observed, 0 = missing.
+            device: 'cuda' or 'cpu'
+        """
+        self.device = device
+        if mask.dim() == 2:
+            self.mask = mask.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, H, W)
+        elif mask.dim() == 3:
+            self.mask = mask.unsqueeze(0).to(device)
+        else:
+            self.mask = mask.to(device)
+
+    def forward(self, x):
+        """Apply mask: zero out missing pixels."""
+        return x * self.mask
+
+    def adjoint(self, y):
+        """Adjoint is the same for a diagonal binary operator."""
+        return y * self.mask
+
+    def project(self, x):
+        """Project onto observed pixels."""
+        return x * self.mask
+
+    def null_project(self, x):
+        """Project onto missing pixels."""
+        return x * (1.0 - self.mask)
+
+
+def create_center_mask(H: int, W: int, hole_h: int = 128, hole_w: int = 128,
+                        device: str = 'cuda') -> torch.Tensor:
+    """
+    Create a mask with a centered rectangular hole.
+
+    Args:
+        H, W: Frame dimensions
+        hole_h, hole_w: Size of the missing rectangle
+        device: 'cuda' or 'cpu'
 
     Returns:
-        operator: DemosaicingOperator instance
-        mosaiced: (T, 3, H, W) — the CFA-sampled observation
-        naive_demosaiced: (T, 3, H, W) — simple baseline for comparison
+        mask: (1, 1, H, W) float tensor. 1 = observed, 0 = missing.
     """
-    operator = DemosaicingOperator(H, W, pattern=pattern, device=device)
-    mosaiced = operator.forward(clean_video)
-    naive_demosaiced = operator.mosaic_to_rgb_nearest(mosaiced)
-    return operator, mosaiced, naive_demosaiced
+    mask = torch.ones(1, 1, H, W)
+    y1 = (H - hole_h) // 2
+    x1 = (W - hole_w) // 2
+    mask[:, :, y1:y1 + hole_h, x1:x1 + hole_w] = 0
+    return mask.to(device)
+
+
+def create_inpainting_degradation(clean_video: torch.Tensor, H: int, W: int,
+                                    hole_h: int = 128, hole_w: int = 128,
+                                    device: str = 'cuda'):
+    """
+    Convenience function: create an inpainting degradation with a center hole.
+
+    Args:
+        clean_video: (T, C, H, W) in [0, 1]
+        H, W: Frame dimensions
+        hole_h, hole_w: Size of missing rectangle
+        device: 'cuda' or 'cpu'
+
+    Returns:
+        operator: InpaintingOperator instance
+        masked_video: (T, C, H, W) — observation with hole zeroed out
+        mask: (1, 1, H, W) — the binary mask
+    """
+    mask = create_center_mask(H, W, hole_h, hole_w, device=device)
+    operator = InpaintingOperator(mask, device=device)
+    masked_video = operator.forward(clean_video)
+    return operator, masked_video, mask

@@ -334,7 +334,7 @@ class ModelTester:
 
         h, w = frames[0].shape[:2]
 
-        # Use ffmpeg with raw pipe input for high-quality H.264 encoding
+        # Use ffmpeg with raw pipe input for lossless H.264 encoding
         cmd = [
             'ffmpeg', '-y',
             '-f', 'rawvideo',
@@ -344,9 +344,9 @@ class ModelTester:
             '-r', str(fps),
             '-i', '-',
             '-c:v', 'libx264',
-            '-crf', '15',          # Near-lossless quality (0=lossless, 23=default)
-            '-preset', 'slow',      # Better compression at same quality
-            '-pix_fmt', 'yuv444p',  # Full chroma, no subsampling
+            '-crf', '0',             # Lossless — zero compression artifacts
+            '-preset', 'medium',        
+            '-pix_fmt', 'yuv444p',   # Full chroma, no subsampling
             save_path
         ]
 
@@ -394,8 +394,8 @@ class ModelTester:
             '-r', str(fps),
             '-i', '-',
             '-c:v', 'libx264',
-            '-crf', '15',
-            '-preset', 'slow',
+            '-crf', '0',
+            '-preset', 'fast',
             '-pix_fmt', 'yuv444p',
             save_path
         ]

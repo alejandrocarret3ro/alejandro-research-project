@@ -336,7 +336,7 @@ def train(
     loss_type="l2",
     loss_alpha=0.5,
     use_amp=True,
-    save_every_n_epochs=10,
+    save_every_n_epochs=2,
     resume_from=None,
     use_torch_compile=True
 ):
